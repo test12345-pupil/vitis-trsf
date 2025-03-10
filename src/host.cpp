@@ -3,6 +3,7 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 #include "experimental/xrt_bo.h"
 #include "experimental/xrt_device.h"
 #include "experimental/xrt_kernel.h"
@@ -12,6 +13,7 @@
 #define D_MODEL 64
 #define D_FFN 256
 #define N_BLOCK 6
+#define N_LAYERS 3
 
 void softmax(float* input, int size) {
     float max_val = input[0];
@@ -32,6 +34,7 @@ void softmax(float* input, int size) {
         input[i] /= sum;
     }
 }
+
 void layer_norm(float* input, float* output, int size) {
     float mean = 0.0f;
     float variance = 0.0f;
@@ -107,7 +110,10 @@ void host_mha(float* D, float* M_Q, float* M_K, float* M_V, float* Output, int s
     }
 }
 
-void host_transformer_block(float* input, float* output, float* M_Q, float* M_K, float* M_V, float* W1, float* W2, int s, int d_input, int d_model, int d_ffn) {
+void host_transformer_block(float* input, float* output,
+                            float* M_Q, float* M_K, float* M_V,
+                            float* W1, float* W2,
+                            int s, int d_input, int d_model, int d_ffn) {
     std::vector<float> temp1(s * d_model, 0.0f);
     std::vector<float> temp2(s * d_model, 0.0f);
 
@@ -147,6 +153,26 @@ void host_transformer_block(float* input, float* output, float* M_Q, float* M_K,
     layer_norm(output, output, s * d_model);
 }
 
+void host_transformer_layers(float* input, float* output,
+                             float* M_Q, float* M_K, float* M_V,
+                             float* W1, float* W2,
+                             int s, int d_input, int d_model, int d_ffn) {
+    // current存放当前层的输入，next存放当前层计算结果
+    std::vector<float> current(input, input + s * d_model);
+    std::vector<float> next(s * d_model, 0.0f);
+    for (int l = 0; l < N_LAYERS; l++) {
+        host_transformer_block(current.data(), next.data(),
+                               M_Q + l * (d_input * d_model),
+                               M_K + l * (d_input * d_model),
+                               M_V + l * (d_input * d_model),
+                               W1 + l * (d_model * d_ffn),
+                               W2 + l * (d_ffn * d_model),
+                               s, d_input, d_model, d_ffn);
+        current.swap(next);
+    }
+    std::copy(current.begin(), current.end(), output);
+}
+
 int main(int argc, char** argv) {
     sda::utils::CmdLineParser parser;
     parser.addSwitch("--xclbin_file", "-x", "input binary file string", "");
@@ -167,44 +193,47 @@ int main(int argc, char** argv) {
 
     size_t size_input_bytes = sizeof(float) * S * D_INPUT;
     size_t size_output_bytes = sizeof(float) * S * D_MODEL;
-    size_t size_M_Q_bytes = sizeof(float) * D_INPUT * D_MODEL;
-    size_t size_M_K_bytes = sizeof(float) * D_INPUT * D_MODEL;
-    size_t size_M_V_bytes = sizeof(float) * D_INPUT * D_MODEL;
-    size_t size_W1_bytes = sizeof(float) * D_MODEL * D_FFN;
-    size_t size_W2_bytes = sizeof(float) * D_FFN * D_MODEL;
+    // 多层时，每层权重需要额外扩展第一维
+    size_t size_M_Q_bytes = sizeof(float) * N_LAYERS * D_INPUT * D_MODEL;
+    size_t size_M_K_bytes = sizeof(float) * N_LAYERS * D_INPUT * D_MODEL;
+    size_t size_M_V_bytes = sizeof(float) * N_LAYERS * D_INPUT * D_MODEL;
+    size_t size_W1_bytes  = sizeof(float) * N_LAYERS * D_MODEL * D_FFN;
+    size_t size_W2_bytes  = sizeof(float) * N_LAYERS * D_FFN * D_MODEL;
 
     auto bo_M_Q = xrt::bo(device, size_M_Q_bytes, krnl.group_id(2));
     auto bo_M_K = xrt::bo(device, size_M_K_bytes, krnl.group_id(3));
     auto bo_M_V = xrt::bo(device, size_M_V_bytes, krnl.group_id(4));
-    auto bo_W1 = xrt::bo(device, size_W1_bytes, krnl.group_id(5));
-    auto bo_W2 = xrt::bo(device, size_W2_bytes, krnl.group_id(6));
+    auto bo_W1  = xrt::bo(device, size_W1_bytes,  krnl.group_id(5));
+    auto bo_W2  = xrt::bo(device, size_W2_bytes,  krnl.group_id(6));
     auto bo_M_Q_map = bo_M_Q.map<float*>();
     auto bo_M_K_map = bo_M_K.map<float*>();
     auto bo_M_V_map = bo_M_V.map<float*>();
-    auto bo_W1_map = bo_W1.map<float*>();
-    auto bo_W2_map = bo_W2.map<float*>();
-
-    for (int i = 0; i < D_INPUT * D_MODEL; i++) {
-        bo_M_Q_map[i] = static_cast<float>(i) / (D_INPUT * D_MODEL);
-        bo_M_K_map[i] = static_cast<float>(i) / (D_INPUT * D_MODEL);
-        bo_M_V_map[i] = static_cast<float>(i) / (D_INPUT * D_MODEL);
-    }
-    for (int i = 0; i < D_MODEL * D_FFN; i++) {
-        bo_W1_map[i] = static_cast<float>(i) / (D_MODEL * D_FFN);
-    }
-    for (int i = 0; i < D_FFN * D_MODEL; i++) {
-        bo_W2_map[i] = static_cast<float>(i) / (D_FFN * D_MODEL);
-    }
-
-    bo_M_Q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bo_M_K.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bo_M_V.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bo_W1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bo_W2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
+    auto bo_W1_map  = bo_W1.map<float*>();
+    auto bo_W2_map  = bo_W2.map<float*>();
 
     const int num_tests = 5;
     for (int test = 0; test < num_tests; test++) {
+
+        // 初始化各层的权重数据（简单赋值，实际可根据需要调整）
+        for (int l = 0; l < N_LAYERS; l++) {
+            for (int i = 0; i < D_INPUT * D_MODEL; i++) {
+                bo_M_Q_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL) + test;
+                bo_M_K_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL) + test;
+                bo_M_V_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL) + test;
+            }
+            for (int i = 0; i < D_MODEL * D_FFN; i++) {
+                bo_W1_map[l * (D_MODEL * D_FFN) + i] = static_cast<float>(i) / (D_MODEL * D_FFN) + test;
+            }
+            for (int i = 0; i < D_FFN * D_MODEL; i++) {
+                bo_W2_map[l * (D_FFN * D_MODEL) + i] = static_cast<float>(i) / (D_FFN * D_MODEL) + test;
+            }
+        }
+
+        bo_M_Q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_M_K.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_M_V.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_W1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_W2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         auto bo_input = xrt::bo(device, size_input_bytes, krnl.group_id(0));
         auto bo_output = xrt::bo(device, size_output_bytes, krnl.group_id(1));
@@ -218,22 +247,27 @@ int main(int argc, char** argv) {
         bo_input.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         std::fill(bo_output_map, bo_output_map + S * D_MODEL, 0.0f);
-        
         bo_output.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+        // 调用kernel，注意传入的权重指针现在包含了多层数据
         auto run = krnl(bo_input, bo_output, bo_M_Q, bo_M_K, bo_M_V, bo_W1, bo_W2, S, D_INPUT, D_MODEL, D_FFN);
         run.wait(); 
- 
+     
         bo_output.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
         std::vector<float> host_output(S * D_MODEL, 0.0f);
-        host_transformer_block(bo_input_map, host_output.data(), bo_M_Q_map, bo_M_K_map, bo_M_V_map, bo_W1_map, bo_W2_map, S, D_INPUT, D_MODEL, D_FFN);
+        host_transformer_layers(bo_input_map, host_output.data(),
+                                bo_M_Q_map, bo_M_K_map, bo_M_V_map,
+                                bo_W1_map, bo_W2_map,
+                                S, D_INPUT, D_MODEL, D_FFN);
 
         bool passed = true;
         for (int i = 0; i < S * D_MODEL; i++) {
+            std::cout << bo_output_map[i] << ' ' << host_output[i] << '\n';
             if (std::abs(bo_output_map[i] - host_output[i]) > 1e-5) {
                 passed = false;
-                std::cout << "Mismatch at index " << i << ": Kernel=" << bo_output_map[i] << ", Host=" << host_output[i] << std::endl;
+                std::cout << "Mismatch at index " << i << ": Kernel=" << bo_output_map[i]
+                          << ", Host=" << host_output[i] << std::endl;
                 break;
             }
         }
@@ -246,4 +280,4 @@ int main(int argc, char** argv) {
     }
 
     return 0;
-}   
+}
