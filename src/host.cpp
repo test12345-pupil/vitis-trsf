@@ -211,23 +211,23 @@ int main(int argc, char** argv) {
     auto bo_W1_map  = bo_W1.map<float*>();
     auto bo_W2_map  = bo_W2.map<float*>();
 
+    // 初始化各层的权重数据（简单赋值，实际可根据需要调整）
+    for (int l = 0; l < N_LAYERS; l++) {
+        for (int i = 0; i < D_INPUT * D_MODEL; i++) {
+            bo_M_Q_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL);
+            bo_M_K_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL);
+            bo_M_V_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL);
+        }
+        for (int i = 0; i < D_MODEL * D_FFN; i++) {
+            bo_W1_map[l * (D_MODEL * D_FFN) + i] = static_cast<float>(i) / (D_MODEL * D_FFN);
+        }
+        for (int i = 0; i < D_FFN * D_MODEL; i++) {
+            bo_W2_map[l * (D_FFN * D_MODEL) + i] = static_cast<float>(i) / (D_FFN * D_MODEL);
+        }
+    }
     const int num_tests = 5;
     for (int test = 0; test < num_tests; test++) {
 
-        // 初始化各层的权重数据（简单赋值，实际可根据需要调整）
-        for (int l = 0; l < N_LAYERS; l++) {
-            for (int i = 0; i < D_INPUT * D_MODEL; i++) {
-                bo_M_Q_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL) + test;
-                bo_M_K_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL) + test;
-                bo_M_V_map[l * (D_INPUT * D_MODEL) + i] = static_cast<float>(i) / (D_INPUT * D_MODEL) + test;
-            }
-            for (int i = 0; i < D_MODEL * D_FFN; i++) {
-                bo_W1_map[l * (D_MODEL * D_FFN) + i] = static_cast<float>(i) / (D_MODEL * D_FFN) + test;
-            }
-            for (int i = 0; i < D_FFN * D_MODEL; i++) {
-                bo_W2_map[l * (D_FFN * D_MODEL) + i] = static_cast<float>(i) / (D_FFN * D_MODEL) + test;
-            }
-        }
 
         bo_M_Q.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         bo_M_K.sync(XCL_BO_SYNC_BO_TO_DEVICE);
